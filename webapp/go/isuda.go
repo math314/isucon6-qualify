@@ -412,10 +412,13 @@ func main() {
 		dbname = "isuda"
 	}
 
-	db, err = sql.Open("mysql", fmt.Sprintf(
+	connectionStr := fmt.Sprintf(
 		"%s:%s@tcp(%s:%d)/%s?loc=Local&parseTime=true",
 		user, password, host, port, dbname,
-	))
+	)
+	log.Print(connectionStr)
+
+	db, err = sql.Open("mysql", connectionStr)
 	if err != nil {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
@@ -476,5 +479,16 @@ func main() {
 	k.Methods("POST").HandlerFunc(myHandler(keywordByKeywordDeleteHandler))
 
 	r.PathPrefix("/").Handler(http.FileServer(http.Dir("./public/")))
+
+	loggingMiddleware := func (next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Do stuff here
+			log.Println(r.RequestURI)
+			// Call the next handler, which can be another middleware in the chain, or the final handler.
+			next.ServeHTTP(w, r)
+		})
+	}
+	r.Use(loggingMiddleware)
+
 	log.Fatal(http.ListenAndServe(":5000", r))
 }

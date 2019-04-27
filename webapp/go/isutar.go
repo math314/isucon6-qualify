@@ -73,32 +73,35 @@ func starsPostHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	host := os.Getenv("ISUTAR_DB_HOST")
+	host := os.Getenv("ISUDA_DB_HOST")
 	if host == "" {
 		host = "localhost"
 	}
-	portstr := os.Getenv("ISUTAR_DB_PORT")
+	portstr := os.Getenv("ISUDA_DB_PORT")
 	if portstr == "" {
 		portstr = "3306"
 	}
 	port, err := strconv.Atoi(portstr)
 	if err != nil {
-		log.Fatalf("Failed to read DB port number from an environment variable ISUTAR_DB_PORT.\nError: %s", err.Error())
+		log.Fatalf("Failed to read DB port number from an environment variable ISUDA_DB_PORT.\nError: %s", err.Error())
 	}
-	user := os.Getenv("ISUTAR_DB_USER")
+	user := os.Getenv("ISUDA_DB_USER")
 	if user == "" {
 		user = "root"
 	}
-	password := os.Getenv("ISUTAR_DB_PASSWORD")
-	dbname := os.Getenv("ISUTAR_DB_NAME")
+	password := os.Getenv("ISUDA_DB_PASSWORD")
+	dbname := os.Getenv("ISUDA_DB_NAME")
 	if dbname == "" {
-		dbname = "isutar"
+		dbname = "isuda"
 	}
 
-	db, err = sql.Open("mysql", fmt.Sprintf(
+	connectionStr := fmt.Sprintf(
 		"%s:%s@tcp(%s:%d)/%s?loc=Local&parseTime=true",
 		user, password, host, port, dbname,
-	))
+	)
+	log.Print(connectionStr)
+
+	db, err = sql.Open("mysql", connectionStr)
 	if err != nil {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}

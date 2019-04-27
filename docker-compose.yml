@@ -1,0 +1,55 @@
+version: '3'
+services:
+  bench:
+    build:
+      context: ./bench
+    image: isucon6-qualifier-bench
+    depends_on:
+      - nginx
+    networks:
+      - frontend
+  nginx:
+    build:
+      context: ./nginx
+    image: isucon6-qualifier-nginx
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+  app:
+    build:
+      context: ./webapp
+    image: isucon6-qualifier-app:golang
+    depends_on:
+       - db
+    networks:
+      - backend
+    ports:
+      - "5000:5000"
+      - "5001:5001"
+    environment:
+      ISUDA_DB_USER: isucon
+      ISUDA_DB_PASSWORD: isucon
+      ISUDA_DB_HOST: db
+  db:
+    build:
+      context: ./db
+    image: isucon6-qualifier-db
+    ports:
+      - "3306:3306"
+    networks:
+      - backend
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+    command: ["--character-set-server=utf8mb4"]
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: isuda
+      MYSQL_USER: isucon
+      MYSQL_PASSWORD: isucon
+networks:
+  frontend:
+  backend:
