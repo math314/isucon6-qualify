@@ -15,8 +15,10 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Songmu/strrand"
 	_ "github.com/go-sql-driver/mysql"
@@ -25,13 +27,94 @@ import (
 	"github.com/unrolled/render"
 )
 
+type Entry struct {
+	ID          int
+	AuthorID    int
+	Keyword     string
+	Description string
+	UpdatedAt   time.Time
+	CreatedAt   time.Time
+
+	Html  string
+	Stars []*Star
+}
+
+type User struct {
+	ID        int
+	Name      string
+	Salt      string
+	Password  string
+	CreatedAt time.Time
+}
+
+type Star struct {
+	ID        int       `json:"id"`
+	Keyword   string    `json:"keyword"`
+	UserName  string    `json:"user_name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type EntryWithCtx struct {
+	Context context.Context
+	Entry   Entry
+}
+
+
+func prepareHandler(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h := r.Header.Get("X-Forwarded-Host"); h != "" {
+			baseUrl, _ = url.Parse("http://" + h)
+		} else {
+			baseUrl, _ = url.Parse("http://" + r.Host)
+		}
+		fn(w, r)
+	}
+}
+
+func myHandler(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				fmt.Fprintf(os.Stderr, "%+v", err)
+				debug.PrintStack()
+				http.Error(w, http.StatusText(500), 500)
+			}
+		}()
+		prepareHandler(fn)(w, r)
+	}
+}
+
+func pathURIEscape(s string) string {
+	return (&url.URL{Path: s}).String()
+}
+
+func notFound(w http.ResponseWriter) {
+	code := http.StatusNotFound
+	http.Error(w, http.StatusText(code), code)
+}
+
+func badRequest(w http.ResponseWriter) {
+	code := http.StatusBadRequest
+	http.Error(w, http.StatusText(code), code)
+}
+
+func forbidden(w http.ResponseWriter) {
+	code := http.StatusForbidden
+	http.Error(w, http.StatusText(code), code)
+}
+
+func panicIf(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
 const (
 	sessionName   = "isuda_session"
 	sessionSecret = "tonymoris"
 )
 
 var (
-	isutarEndpoint string
 	isupamEndpoint string
 
 	baseUrl *url.URL
@@ -73,9 +156,42 @@ func initializeHandler(w http.ResponseWriter, r *http.Request) {
 	_, err := db.Exec(`DELETE FROM entry WHERE id > 7101`)
 	panicIf(err)
 
-	resp, err := http.Get(fmt.Sprintf("%s/initialize", isutarEndpoint))
+	_, err = db.Exec("TRUNCATE star")
+	panicIf(err)
+
+	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+}
+
+
+func starsHandler(w http.ResponseWriter, r *http.Request) {
+	keyword := r.FormValue("keyword")
+	stars := loadStars(keyword)
+
+	re.JSON(w, http.StatusOK, map[string][]*Star{
+		"result": stars,
+	})
+}
+
+func starsPostHandler(w http.ResponseWriter, r *http.Request) {
+	keyword := r.FormValue("keyword")
+
+	origin := os.Getenv("ISUDA_ORIGIN")
+	if origin == "" {
+		origin = "http://localhost:5000"
+	}
+	u, err := r.URL.Parse(fmt.Sprintf("%s/keyword/%s", origin, pathURIEscape(keyword)))
+	panicIf(err)
+	resp, err := http.Get(u.String())
 	panicIf(err)
 	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		notFound(w)
+		return
+	}
+
+	user := r.FormValue("user")
+	_, err = db.Exec(`INSERT INTO star (keyword, user_name, created_at) VALUES (?, ?, NOW())`, keyword, user)
+	panicIf(err)
 
 	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
 }
@@ -256,6 +372,7 @@ func keywordByKeywordHandler(w http.ResponseWriter, r *http.Request) {
 
 	keyword := mux.Vars(r)["keyword"]
 	row := db.QueryRow(`SELECT * FROM entry WHERE keyword = ?`, keyword)
+	log.Printf("keyword = %s", keyword)
 	e := Entry{}
 	err := row.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
 	if err == sql.ErrNoRows {
@@ -342,18 +459,21 @@ func htmlify(w http.ResponseWriter, r *http.Request, content string) string {
 }
 
 func loadStars(keyword string) []*Star {
-	v := url.Values{}
-	v.Set("keyword", keyword)
-	resp, err := http.Get(fmt.Sprintf("%s/stars", isutarEndpoint) + "?" + v.Encode())
-	panicIf(err)
-	defer resp.Body.Close()
-
-	var data struct {
-		Result []*Star `json:result`
+	rows, err := db.Query(`SELECT * FROM star WHERE keyword = ?`, keyword)
+	if err != nil && err != sql.ErrNoRows {
+		panicIf(err)
+		return nil
 	}
-	err = json.NewDecoder(resp.Body).Decode(&data)
-	panicIf(err)
-	return data.Result
+
+	stars := make([]*Star, 0, 10)
+	for rows.Next() {
+		s := &Star{}
+		err := rows.Scan(&s.ID, &s.Keyword, &s.UserName, &s.CreatedAt)
+		panicIf(err)
+		stars = append(stars, s)
+	}
+	rows.Close()
+	return stars
 }
 
 func isSpamContents(content string) bool {
@@ -425,10 +545,6 @@ func main() {
 	db.Exec("SET SESSION sql_mode='TRADITIONAL,NO_AUTO_VALUE_ON_ZERO,ONLY_FULL_GROUP_BY'")
 	db.Exec("SET NAMES utf8mb4")
 
-	isutarEndpoint = os.Getenv("ISUTAR_ORIGIN")
-	if isutarEndpoint == "" {
-		isutarEndpoint = "http://localhost:5001"
-	}
 	isupamEndpoint = os.Getenv("ISUPAM_ORIGIN")
 	if isupamEndpoint == "" {
 		isupamEndpoint = "http://localhost:5050"
@@ -436,8 +552,13 @@ func main() {
 
 	store = sessions.NewCookieStore([]byte(sessionSecret))
 
+	viewDir := os.Getenv("viewDir")
+	if viewDir == "" {
+		viewDir= "views"
+	}
+
 	re = render.New(render.Options{
-		Directory: "views",
+		Directory: viewDir,
 		Funcs: []template.FuncMap{
 			{
 				"url_for": func(path string) string {
@@ -477,6 +598,10 @@ func main() {
 	k := r.PathPrefix("/keyword/{keyword}").Subrouter()
 	k.Methods("GET").HandlerFunc(myHandler(keywordByKeywordHandler))
 	k.Methods("POST").HandlerFunc(myHandler(keywordByKeywordDeleteHandler))
+
+	s := r.PathPrefix("/stars").Subrouter()
+	s.Methods("GET").HandlerFunc(myHandler(starsHandler))
+	s.Methods("POST").HandlerFunc(myHandler(starsPostHandler))
 
 	r.PathPrefix("/").Handler(http.FileServer(http.Dir("./public/")))
 

@@ -1,9 +1,11 @@
 FROM golang:1.11
 
-COPY ./go /go
-COPY ./bin/isupam_linux /go/isupam_linux
-WORKDIR /go
+COPY src /go/src
+COPY ./bin/isupam_linux /go/src/isupam_linux
+WORKDIR /go/src
+
+ENV GOPATH=/go
 
 RUN make
 
-ENTRYPOINT ["/go/entry-point.sh"]
+ENTRYPOINT ["/go/src/entry-point.sh"]
