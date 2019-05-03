@@ -1,4 +1,4 @@
-version: '3'
+version: '2.2'
 services:
   bench:
     build:
@@ -8,6 +8,7 @@ services:
       - nginx
     networks:
       - frontend
+    cpus: 2
   nginx:
     build:
       context: ./nginx
@@ -19,6 +20,7 @@ services:
       - app
     ports:
       - "80:80"
+    cpus: 1
   app:
     build:
       context: ./webapp
@@ -29,11 +31,12 @@ services:
       - backend
     ports:
       - "5000:5000"
-      - "5001:5001"
     environment:
       ISUDA_DB_USER: isucon
       ISUDA_DB_PASSWORD: isucon
       ISUDA_DB_HOST: db
+    cpus: 2
+    mem_limit: 2g
   db:
     build:
       context: ./db
@@ -50,6 +53,8 @@ services:
       MYSQL_DATABASE: isuda
       MYSQL_USER: isucon
       MYSQL_PASSWORD: isucon
+    cpus: 2
+    mem_limit: 2g      
 networks:
   frontend:
   backend:
