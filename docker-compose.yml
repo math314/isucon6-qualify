@@ -31,6 +31,7 @@ services:
       - backend
     ports:
       - "5000:5000"
+      - "6060:6060"
     environment:
       ISUDA_DB_USER: isucon
       ISUDA_DB_PASSWORD: isucon

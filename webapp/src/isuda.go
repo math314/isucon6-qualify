@@ -25,6 +25,8 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
 	"github.com/unrolled/render"
+
+	_ "net/http/pprof"
 )
 
 type Entry struct {
@@ -513,6 +515,12 @@ func getSession(w http.ResponseWriter, r *http.Request) *sessions.Session {
 }
 
 func main() {
+	if os.Getenv("DISABLE_PROF") != "1" {
+		go func() {
+			log.Println(http.ListenAndServe(":6060", nil))
+		}()
+	}
+
 	host := os.Getenv("ISUDA_DB_HOST")
 	if host == "" {
 		host = "localhost"
