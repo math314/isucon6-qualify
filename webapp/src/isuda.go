@@ -11,10 +11,10 @@ import (
 	"html/template"
 	"log"
 	"math"
+	"mdb"
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -38,7 +38,7 @@ type Entry struct {
 	CreatedAt   time.Time
 
 	Html  string
-	Stars []*Star
+	Stars []*mdb.Star
 }
 
 type User struct {
@@ -47,13 +47,6 @@ type User struct {
 	Salt      string
 	Password  string
 	CreatedAt time.Time
-}
-
-type Star struct {
-	ID        int       `json:"id"`
-	Keyword   string    `json:"keyword"`
-	UserName  string    `json:"user_name"`
-	CreatedAt time.Time `json:"created_at"`
 }
 
 type EntryWithCtx struct {
@@ -125,6 +118,9 @@ var (
 	store   *sessions.CookieStore
 
 	errInvalidUser = errors.New("Invalid User")
+
+	entryStore *mdb.EntryStore
+	starStore *mdb.StarStore
 )
 
 func setName(w http.ResponseWriter, r *http.Request) error {
@@ -157,9 +153,17 @@ func authenticate(w http.ResponseWriter, r *http.Request) error {
 func initializeHandler(w http.ResponseWriter, r *http.Request) {
 	_, err := db.Exec(`DELETE FROM entry WHERE id > 7101`)
 	panicIf(err)
+	if entryStore != nil {
+		entryStore.Close()
+	}
+	entryStore = mdb.NewEntryStore(db)
 
 	_, err = db.Exec("TRUNCATE star")
 	panicIf(err)
+	if starStore != nil {
+		starStore.Close()
+	}
+	starStore = mdb.NewStarStore(db)
 
 	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
 }
@@ -169,7 +173,7 @@ func starsHandler(w http.ResponseWriter, r *http.Request) {
 	keyword := r.FormValue("keyword")
 	stars := loadStars(keyword)
 
-	re.JSON(w, http.StatusOK, map[string][]*Star{
+	re.JSON(w, http.StatusOK, map[string][]*mdb.Star{
 		"result": stars,
 	})
 }
@@ -177,23 +181,14 @@ func starsHandler(w http.ResponseWriter, r *http.Request) {
 func starsPostHandler(w http.ResponseWriter, r *http.Request) {
 	keyword := r.FormValue("keyword")
 
-	origin := os.Getenv("ISUDA_ORIGIN")
-	if origin == "" {
-		origin = "http://localhost:5000"
-	}
-	u, err := r.URL.Parse(fmt.Sprintf("%s/keyword/%s", origin, pathURIEscape(keyword)))
-	panicIf(err)
-	resp, err := http.Get(u.String())
-	panicIf(err)
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	exists := entryStore.KeywordExists(keyword)
+	if !exists {
 		notFound(w)
 		return
 	}
 
 	user := r.FormValue("user")
-	_, err = db.Exec(`INSERT INTO star (keyword, user_name, created_at) VALUES (?, ?, NOW())`, keyword, user)
-	panicIf(err)
+	starStore.Insert(keyword, user)
 
 	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
 }
@@ -211,31 +206,24 @@ func topHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	page, _ := strconv.Atoi(p)
 
-	rows, err := db.Query(fmt.Sprintf(
-		"SELECT * FROM entry ORDER BY updated_at DESC LIMIT %d OFFSET %d",
-		perPage, perPage*(page-1),
-	))
-	if err != nil && err != sql.ErrNoRows {
-		panicIf(err)
-	}
-	entries := make([]*Entry, 0, 10)
-	for rows.Next() {
-		e := Entry{}
-		err := rows.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
-		panicIf(err)
-		e.Html = htmlify(w, r, e.Description)
-		e.Stars = loadStars(e.Keyword)
-		entries = append(entries, &e)
-	}
-	rows.Close()
+	oriEntries := entryStore.SelectTopNSkipMOrderByUpdated(perPage, perPage*(page-1))
+	entries := make([]*Entry, len(oriEntries))
 
-	var totalEntries int
-	row := db.QueryRow(`SELECT COUNT(*) FROM entry`)
-	err = row.Scan(&totalEntries)
-	if err != nil && err != sql.ErrNoRows {
-		panicIf(err)
+	x := loadReplacer()
+	for i, e := range oriEntries {
+		entries[i] = &Entry{
+			ID: e.ID,
+			Keyword: e.Keyword,
+			Description: e.Description,
+			UpdatedAt: e.UpdatedAt,
+			AuthorID: e.AuthorID,
+			CreatedAt: e.CreatedAt,
+		}
+		entries[i].Html = htmlify(w, r, x, e.Description)
+		entries[i].Stars = loadStars(e.Keyword)
 	}
 
+	totalEntries := entryStore.TotalCount()
 	lastPage := int(math.Ceil(float64(totalEntries) / float64(perPage)))
 	pages := make([]int, 0, 10)
 	start := int(math.Max(float64(1), float64(page-5)))
@@ -281,12 +269,7 @@ func keywordPostHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "SPAM!", http.StatusBadRequest)
 		return
 	}
-	_, err := db.Exec(`
-		INSERT INTO entry (author_id, keyword, description, created_at, updated_at)
-		VALUES (?, ?, ?, NOW(), NOW())
-		ON DUPLICATE KEY UPDATE
-		author_id = ?, keyword = ?, description = ?, updated_at = NOW()
-	`, userID, keyword, description, userID, keyword, description)
+	err := entryStore.UpdateOrInsertWithKeyword(keyword, userID, description)
 	panicIf(err)
 	http.Redirect(w, r, "/", http.StatusFound)
 }
@@ -375,15 +358,23 @@ func keywordByKeywordHandler(w http.ResponseWriter, r *http.Request) {
 	keyword, err := url.QueryUnescape(mux.Vars(r)["keyword"])
 	panicIf(err)
 
-	row := db.QueryRow(`SELECT * FROM entry WHERE keyword = ?`, keyword)
-	log.Printf("keyword = %s", keyword)
-	e := Entry{}
-	err = row.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
-	if err == sql.ErrNoRows {
+	orie, error := entryStore.SelectWithKeyword(keyword)
+	if error != nil {
 		notFound(w)
 		return
 	}
-	e.Html = htmlify(w, r, e.Description)
+
+	x := loadReplacer()
+
+	e := Entry{
+		ID: orie.ID,
+		Keyword: orie.Keyword,
+		Description: orie.Description,
+		UpdatedAt: orie.UpdatedAt,
+		AuthorID: orie.AuthorID,
+		CreatedAt: orie.CreatedAt,
+	}
+	e.Html = htmlify(w, r, x, e.Description)
 	e.Stars = loadStars(e.Keyword)
 
 	re.HTML(w, http.StatusOK, "keyword", struct {
@@ -414,74 +405,67 @@ func keywordByKeywordDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	row := db.QueryRow(`SELECT * FROM entry WHERE keyword = ?`, keyword)
-	e := Entry{}
-	err = row.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
-	if err == sql.ErrNoRows {
+
+	exists := entryStore.KeywordExists(keyword)
+	if !exists {
 		notFound(w)
 		return
 	}
-	_, err = db.Exec(`DELETE FROM entry WHERE keyword = ?`, keyword)
+	err = entryStore.DeleteWithKeyword(keyword)
 	panicIf(err)
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-func htmlify(w http.ResponseWriter, r *http.Request, content string) string {
+type Replacer struct {
+	r *strings.Replacer
+	lastUpdated int64
+}
+
+var cachedReplacer *Replacer
+
+func loadReplacer() *Replacer {
+	cacheLastUpdated := int64(0)
+	if cachedReplacer != nil {
+		cacheLastUpdated = cachedReplacer.lastUpdated
+	}
+
+	lastUpdated := entryStore.KeywordLastUpdated()
+	if cacheLastUpdated >= lastUpdated {
+		return cachedReplacer
+	}
+
+	keywords := entryStore.GetAllKeywordsOrderByLength()
+	keywordsWithReplace := make([]string, 0, len(keywords) * 2)
+	for _, k := range keywords {
+		u := baseUrl.String()+"/keyword/" + pathURIEscape(k)
+		link := fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(k))
+		keywordsWithReplace = append(keywordsWithReplace, k)
+		keywordsWithReplace = append(keywordsWithReplace, link)
+	}
+
+	cachedReplacer = &Replacer{
+		strings.NewReplacer(keywordsWithReplace...), lastUpdated,
+	}
+	return cachedReplacer
+}
+
+func htmlify(w http.ResponseWriter, r *http.Request, x *Replacer, content string) string {
 	if content == "" {
 		return ""
 	}
-	rows, err := db.Query(`
-		SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC
-	`)
-	panicIf(err)
-	entries := make([]*Entry, 0, 500)
-	for rows.Next() {
-		e := Entry{}
-		err := rows.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
-		panicIf(err)
-		entries = append(entries, &e)
-	}
-	rows.Close()
-
-	keywords := make([]string, 0, 500)
-	for _, entry := range entries {
-		keywords = append(keywords, regexp.QuoteMeta(entry.Keyword))
-	}
-	re := regexp.MustCompile("("+strings.Join(keywords, "|")+")")
-	kw2sha := make(map[string]string)
-	content = re.ReplaceAllStringFunc(content, func(kw string) string {
-		kw2sha[kw] = "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(kw)))
-		return kw2sha[kw]
-	})
-	content = html.EscapeString(content)
-	for kw, hash := range kw2sha {
-		u, err := r.URL.Parse(baseUrl.String()+"/keyword/" + pathURIEscape(kw))
-		panicIf(err)
-		link := fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(kw))
-		content = strings.Replace(content, hash, link, -1)
-	}
+	content = x.r.Replace(content)
 	return strings.Replace(content, "\n", "<br />\n", -1)
 }
 
-func loadStars(keyword string) []*Star {
-	rows, err := db.Query(`SELECT * FROM star WHERE keyword = ?`, keyword)
-	if err != nil && err != sql.ErrNoRows {
-		panicIf(err)
-		return nil
-	}
-
-	stars := make([]*Star, 0, 10)
-	for rows.Next() {
-		s := &Star{}
-		err := rows.Scan(&s.ID, &s.Keyword, &s.UserName, &s.CreatedAt)
-		panicIf(err)
-		stars = append(stars, s)
-	}
-	rows.Close()
-	return stars
+func loadStars(keyword string) []*mdb.Star {
+	return starStore.SelectWithKeyword(keyword)
 }
 
 func isSpamContents(content string) bool {
+	if os.Getenv("LOCAL") == "1" {
+		return false
+	}
+
 	v := url.Values{}
 	v.Set("content", content)
 	resp, err := http.PostForm(isupamEndpoint, v)
@@ -555,6 +539,9 @@ func main() {
 	}
 	db.Exec("SET SESSION sql_mode='TRADITIONAL,NO_AUTO_VALUE_ON_ZERO,ONLY_FULL_GROUP_BY'")
 	db.Exec("SET NAMES utf8mb4")
+
+	entryStore = mdb.NewEntryStore(db)
+	starStore = mdb.NewStarStore(db)
 
 	isupamEndpoint = os.Getenv("ISUPAM_ORIGIN")
 	if isupamEndpoint == "" {
